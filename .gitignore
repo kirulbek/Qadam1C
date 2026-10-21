@@ -1,0 +1,15 @@
+bin/
+obj/
+.dotnet/
+release/
+installer/tools/
+*.user
+*.suo
+*.log
+*.bsl
+.vs/
+data/metadata*.json
+data/favorites*.json
+data/completion-history.json
+data/workspace-panel.json
+data/module-move-backups/

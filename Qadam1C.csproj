@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Version>0.1.3</Version>
+    <UseWindowsForms>true</UseWindowsForms>
+    <UseWPF>true</UseWPF>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <ApplicationIcon>assets\qadam1c.ico</ApplicationIcon>
+    <DefaultItemExcludes>$(DefaultItemExcludes);tools/**;research/**;integration/**;release/**;installer/**</DefaultItemExcludes>
+  </PropertyGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="assets\qadam1c.ico" LogicalName="Qadam1C.AppIcon.ico" />
+    <Content Include="data\1cnik.st" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="data\default-snippets.json" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>
