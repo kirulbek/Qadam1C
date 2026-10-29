@@ -9,22 +9,28 @@ internal static class MetadataScanner
     private static AutomationElement? Named(AutomationElement root, string name) => root.FindAll(TreeScope.Descendants,
         new PropertyCondition(AutomationElement.NameProperty, name)).Cast<AutomationElement>()
         .FirstOrDefault(e => !e.Current.IsOffscreen && e.Current.IsEnabled);
+    // 1C providers may advertise Invoke on custom controls with unsafe behaviour.
+    // Use only a verified physical click, never the provider's default action.
     private static void Invoke(AutomationElement element)
     {
-        try
-        {
-            if (element.TryGetCurrentPattern(InvokePattern.Pattern, out var raw)) { ((InvokePattern)raw).Invoke(); return; }
-            if (element.TryGetCurrentPattern(SelectionItemPattern.Pattern, out raw)) { ((SelectionItemPattern)raw).Select(); return; }
-            if (element.TryGetCurrentPattern(ExpandCollapsePattern.Pattern, out raw)) { ((ExpandCollapsePattern)raw).Expand(); return; }
-        }
-        catch (NotImplementedException) { /* 1C advertises some patterns without implementing them. */ }
-        if (element.Current.IsEnabled && !element.Current.BoundingRectangle.IsEmpty)
+        if (element.Current.IsEnabled && !element.Current.IsOffscreen && !element.Current.BoundingRectangle.IsEmpty)
         {
             GetWindowThreadProcessId(GetForegroundWindow(), out var foregroundPid);
             if (foregroundPid != element.Current.ProcessId)
                 throw new InvalidOperationException("Фокус переключён из 1С. Вернитесь в Конфигуратор и повторите сканирование.");
             var bounds = element.Current.BoundingRectangle;
-            if (!SetCursorPos((int)(bounds.Left + bounds.Width / 2), (int)(bounds.Top + bounds.Height / 2))) throw new InvalidOperationException("Не удалось нажать элемент 1С.");
+            var point = new System.Windows.Point((int)(bounds.Left + bounds.Width / 2), (int)(bounds.Top + bounds.Height / 2));
+            if (!SetCursorPos((int)point.X, (int)point.Y)) throw new InvalidOperationException("Не удалось нажать элемент 1С.");
+            // A dialog may have disappeared or another window may cover the target.
+            var hit = AutomationElement.FromPoint(point);
+            var matches = false;
+            for (var parent = hit; parent is not null; parent = TreeWalker.RawViewWalker.GetParent(parent))
+            {
+                if (Automation.Compare(parent, element)) { matches = true; break; }
+                if (parent.Current.ControlType == ControlType.Window) break;
+            }
+            if (!matches || hit.Current.ProcessId != foregroundPid)
+                throw new InvalidOperationException("Элемент 1С переместился или перекрыт. Сканирование остановлено без нажатия.");
             mouse_event(2, 0, 0, 0, UIntPtr.Zero);
             mouse_event(4, 0, 0, 0, UIntPtr.Zero);
         }
@@ -43,17 +49,30 @@ internal static class MetadataScanner
     }
     public static async Task<string> Scan(ConfiguratorTarget target, string directory, IProgress<string> progress, CancellationToken token)
     {
+        void Stage(string message)
+        {
+            progress.Report(message);
+            try
+            {
+                var log = AppDataPaths.FilePath("metadata-scan.log");
+                Directory.CreateDirectory(Path.GetDirectoryName(log)!);
+                File.AppendAllText(log, $"{DateTimeOffset.Now:O} pid={target.Pid} {message}{Environment.NewLine}");
+            }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+        }
+        Stage("Начало сканирования (проверенные нажатия, без Invoke).");
         if (!ConfiguratorTarget.List().Any(t => t.Pid == target.Pid && t.Started == target.Started)) throw new InvalidOperationException("Конфигуратор уже закрыт.");
         var hwnd = new IntPtr(target.Window);
-        ShowWindow(hwnd, 9);
+        if (IsIconic(hwnd)) ShowWindow(hwnd, 9);
         if (!SetForegroundWindow(hwnd)) throw new InvalidOperationException("Переключитесь в выбранный Конфигуратор и повторите сканирование.");
         var root = AutomationElement.FromHandle(hwnd);
-        AutomationElement? ReportDialog() => Named(root, "Отчет по конфигурации") ??
-            AutomationElement.RootElement.FindAll(TreeScope.Children,
-                new PropertyCondition(AutomationElement.ProcessIdProperty, target.Pid))
-                .Cast<AutomationElement>().Select(w => w.Current.Name == "Отчет по конфигурации" ? w : Named(w, "Отчет по конфигурации"))
-                .FirstOrDefault(w => w is not null);
-        progress.Report("Открываю отчёт по конфигурации…");
+        AutomationElement? ReportDialog() => AutomationElement.RootElement.FindAll(TreeScope.Children,
+                new AndCondition(new PropertyCondition(AutomationElement.ProcessIdProperty, target.Pid),
+                    new PropertyCondition(AutomationElement.NameProperty, "Отчет по конфигурации"),
+                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Window)))
+                .Cast<AutomationElement>().FirstOrDefault(w => !w.Current.IsOffscreen && w.Current.IsEnabled);
+        Stage("Открываю отчёт по конфигурации…");
         var dialog = await Task.Run(ReportDialog, token);
         if (dialog is null)
         {
@@ -64,11 +83,11 @@ internal static class MetadataScanner
                 ?? throw new InvalidOperationException("Не найдено меню «Конфигурация».");
             await Task.Run(() => Invoke(button), token);
             var item = await Wait(() => Named(root, "Отчет по конфигурации..."), token);
-            // Some UIA providers block Invoke until the modal dialog closes.
             var opening = Task.Run(() => Invoke(item), token);
             dialog = await Wait(ReportDialog, token);
             if (opening.IsFaulted) await opening;
         }
+        Stage("Найден отдельный диалог отчёта.");
         var all = dialog.FindAll(TreeScope.Descendants, Condition.TrueCondition).Cast<AutomationElement>().ToArray();
         var scope = all.Where(e => e.Current.ControlType == ControlType.Edit)
             .Select(e => e.TryGetCurrentPattern(ValuePattern.Pattern, out var v) ? ((ValuePattern)v).Current.Value : "")
@@ -85,19 +104,29 @@ internal static class MetadataScanner
         value.SetValue(file);
         if (value.Current.Value != file) throw new InvalidOperationException("1С не подтвердила путь отчёта.");
         token.ThrowIfCancellationRequested();
-        var ok = Named(dialog, "ОК") ?? throw new InvalidOperationException("Не найдена кнопка ОК.");
-        progress.Report("1С формирует отчёт. Ожидание до 5 минут…");
+        var ok = dialog.FindAll(TreeScope.Descendants,
+            new AndCondition(new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button),
+                new PropertyCondition(AutomationElement.NameProperty, "ОК")))
+            .Cast<AutomationElement>().SingleOrDefault(e => !e.Current.IsOffscreen && e.Current.IsEnabled)
+            ?? throw new InvalidOperationException("Не найдена единственная кнопка ОК в диалоге отчёта.");
+        Stage("1С формирует отчёт. Ожидание до 5 минут…");
         var generating = Task.Run(() => Invoke(ok), token);
         // New unique path prevents stale report reuse; exclusive read waits for writer completion.
         for (var i = 0; i < 1200; i++)
         {
             await Task.Delay(250, token);
             if (generating.IsFaulted) await generating;
+            if (!IsWindow(hwnd))
+            {
+                Stage("Окно Конфигуратора закрылось во время формирования отчёта.");
+                throw new InvalidOperationException("1С закрылась во время формирования отчёта. Кэш не изменён. Журнал: " + AppDataPaths.FilePath("metadata-scan.log"));
+            }
             if (!File.Exists(file)) continue;
             try
             {
                 using (var stream = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.None))
                     if (stream.Length == 0) continue;
+                Stage("Отчёт сохранён. Конфигуратор остаётся открытым.");
                 return file;
             }
             catch (IOException) { }
@@ -107,6 +136,8 @@ internal static class MetadataScanner
     }
     [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr window);
     [DllImport("user32.dll")] private static extern bool ShowWindow(IntPtr window, int command);
+    [DllImport("user32.dll")] private static extern bool IsIconic(IntPtr window);
+    [DllImport("user32.dll")] private static extern bool IsWindow(IntPtr window);
     [DllImport("user32.dll")] private static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] private static extern void mouse_event(uint flags, uint x, uint y, uint data, UIntPtr extra);
     [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
@@ -139,7 +170,18 @@ internal sealed class MetadataWindow : Form
                 if (Running) return;
                 try { await action(); }
                 catch (OperationCanceledException) { status.Text = "Ожидание отменено. Уже запущенный отчёт 1С может продолжать формироваться. Кэш не изменён."; }
-                catch (Exception ex) { status.Text = ex.Message; File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "metadata-error.log"), ex.ToString()); }
+                catch (Exception ex)
+                {
+                    status.Text = ex.Message;
+                    try
+                    {
+                        var log = AppDataPaths.FilePath("metadata-error.log");
+                        Directory.CreateDirectory(Path.GetDirectoryName(log)!);
+                        File.WriteAllText(log, ex.ToString());
+                    }
+                    catch (IOException) { }
+                    catch (UnauthorizedAccessException) { }
+                }
             };
             actions.Controls.Add(b);
         }

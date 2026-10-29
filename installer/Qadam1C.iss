@@ -1,7 +1,7 @@
 [Setup]
 AppId={{7B95E12C-E240-4C2A-9298-75585A1370E3}
 AppName=Qadam1C
-AppVersion=0.1.3
+AppVersion=0.1.4
 AppPublisher=Qadam1C
 DefaultDirName={localappdata}\Programs\Qadam1C
 DefaultGroupName=Qadam1C
@@ -10,7 +10,7 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0
 OutputDir=..\release
-OutputBaseFilename=Qadam1C-Setup-0.1.3-x64
+OutputBaseFilename=Qadam1C-Setup-0.1.4-x64
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
