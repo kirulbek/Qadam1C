@@ -88,14 +88,14 @@ internal static class SmartCompletion
     }
 
     public static CompletionChoice[] Find(EditorSnapshot snapshot, IEnumerable<Snippet> snippets,
-        MetadataIndex? metadata, CompletionHistory history, bool manual)
+        MetadataIndex? metadata, CompletionHistory history, bool manual, IReadOnlyList<MetadataIndex>? moduleSources = null)
     {
-        try { return FindCore(snapshot, snippets, metadata, history, manual); }
+        try { return FindCore(snapshot, snippets, metadata, history, manual, moduleSources); }
         catch (RegexMatchTimeoutException) { return []; }
     }
 
     private static CompletionChoice[] FindCore(EditorSnapshot snapshot, IEnumerable<Snippet> snippets,
-        MetadataIndex? metadata, CompletionHistory history, bool manual)
+        MetadataIndex? metadata, CompletionHistory history, bool manual, IReadOnlyList<MetadataIndex>? moduleSources)
     {
         var before = snapshot.Text[..snapshot.Offset];
         var lex = Lex(before);
@@ -106,17 +106,13 @@ internal static class SmartCompletion
         var scopeStart = Matches(code, @"(?im)^\s*(?:Процедура|Функция)\s+").LastOrDefault()?.Index ?? 0;
         var scope = lex.Text[scopeStart..];
         var scopeCode = code[scopeStart..];
-        var dotted = Regex.Match(code, "(" + Id + @")\.(" + Id + @")?$");
+        var dotted = Regex.Match(code, @"\.[\p{L}\p{N}_]*$");
         var closing = Closing(code[..Math.Max(0, code.Length - snapshot.Prefix.Length)]);
         IEnumerable<CompletionChoice> choices;
         if (dotted.Success)
         {
-            var name = dotted.Groups[1].Value;
-            var members = DynamicMembers(scope, scopeCode, name);
-            // Never interpret a suffix of a longer dotted expression as a local variable.
-            if (dotted.Index > 0 && code[dotted.Index - 1] == '.') members = [];
-            choices = members.Select(w => new CompletionChoice(w + "  · поле", snapshot.Prefix.Length, null, w))
-                .Concat(MetadataCompletion.Find(snapshot, metadata) ?? []);
+            choices = TypedCompletion.Find(snapshot, (moduleSources ?? (metadata is null ? [] : [metadata])).ToArray())
+                .Concat(CommonModuleCompletion.Find(snapshot, moduleSources ?? (metadata is null ? [] : [metadata])));
         }
         else if (Regex.IsMatch(line, @"^\s*#(?:Если|ИначеЕсли)\s", RegexOptions.IgnoreCase))
         {

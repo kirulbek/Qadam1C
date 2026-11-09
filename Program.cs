@@ -12,6 +12,20 @@ internal static class Program
         ApplicationConfiguration.Initialize();
         try
         {
+            if (args.Contains("--gutter-test")) return GutterPreview.Check();
+            if (args.Contains("--gutter-inspect")) return GutterPreview.Inspect(int.Parse(args[1]));
+            if (args.Contains("--gutter-layout-inspect")) return NativeEditorLayoutProbe.Run(int.Parse(args[1]));
+            if (args.Contains("--gutter-preview")) return GutterPreview.Run(args.Length > 1 ? int.Parse(args[1]) : 60);
+            if (args.Contains("--export-test")) return ConfigurationExportChecks.Run();
+            if (args.Contains("--typed-test")) return TypedCompletionChecks.Run(args.Length > 1 ? args[1] : null);
+            if (args.Contains("--upgrade-types"))
+            {
+                if (System.Diagnostics.Process.GetProcessesByName("Qadam1C").Any(p => p.Id != Environment.ProcessId))
+                    throw new InvalidOperationException("Закройте Qadam перед обновлением индексов.");
+                new MetadataStore(AppDataPaths.FilePath("metadata.json")).UpgradeTypes(); return 0;
+            }
+            if (args.Contains("--module-completion-test")) return CommonModuleCompletionChecks.Run(args.Length > 1 ? args[1] : null, args.Length > 2 ? int.Parse(args[2]) : null);
+            if (args.Contains("--configuration-test")) return ConfigurationFolderChecks.Run();
             if (args.Contains("--completion-test")) return CompletionChecks.Run();
             if (args.Contains("--smart-completion-test")) return SmartCompletionChecks.Run();
             if (args.Contains("--snippet-test")) return SnippetChecks.Run();
@@ -37,6 +51,12 @@ internal static class Program
                 using var instance = new Mutex(true, "Local\\Qadam1C.Completion", out var ownsInstance);
                 if (!ownsInstance)
                 {
+                    if (args.Contains("--export-wizard") || args.Length == 0)
+                    {
+                        if (EventWaitHandle.TryOpenExisting("Local\\Qadam1C.Export", out var request))
+                        { using (request) request.Set(); }
+                        else MessageBox.Show("Закройте предыдущую версию Qadam1C через значок возле часов → Выход и запустите новую сборку.", "Qadam1C");
+                    }
                     if (args.Contains("--snippet-manager"))
                     {
                         using var request = EventWaitHandle.OpenExisting("Local\\Qadam1C.Templates");
@@ -65,6 +85,7 @@ internal static class Program
                     new MetadataStore(AppDataPaths.FilePath("metadata.json")).Put(index, target.Key);
                 }
                 using var completion = new CompletionContext();
+                if (args.Contains("--export-wizard") || args.Length == 0) completion.OpenExportWizard();
                 if (args.Contains("--snippet-manager")) completion.OpenTemplates();
                 if (args.Contains("--metadata")) completion.OpenMetadata();
                 if (args.Contains("--favorites")) completion.OpenFavorites();
@@ -96,7 +117,16 @@ internal static class Program
         }
         catch (Exception ex)
         {
-            if (args.Contains("--completion-test") || args.Contains("--snippet-test") || args.Contains("--metadata-test") || args.Contains("--smart-completion-test") || args.Contains("--metadata-report-check") || args.Contains("--import-metadata") || args.Contains("--favorites-test") || args.Contains("--outline-test"))
+            if (args.Contains("--gutter-test") || args.Contains("--gutter-preview") || args.Contains("--gutter-inspect") || args.Contains("--gutter-layout-inspect"))
+            { File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "gutter-error.log"), ex.ToString()); return 1; }
+            if (args.Contains("--typed-test") || args.Contains("--upgrade-types"))
+            { File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "typed-error.log"), ex.ToString()); return 1; }
+            if (args.Contains("--module-completion-test"))
+            {
+                File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "module-completion-error.log"), ex.ToString());
+                return 1;
+            }
+            if (args.Contains("--export-test") || args.Contains("--configuration-test") || args.Contains("--completion-test") || args.Contains("--snippet-test") || args.Contains("--metadata-test") || args.Contains("--smart-completion-test") || args.Contains("--metadata-report-check") || args.Contains("--import-metadata") || args.Contains("--favorites-test") || args.Contains("--outline-test"))
             {
                 File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "completion-error.log"), ex.ToString());
                 return 1;

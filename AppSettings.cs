@@ -20,7 +20,9 @@ internal static class WindowsStartup
         get
         {
             using var key = Registry.CurrentUser.OpenSubKey(Key);
-            return string.Equals(key?.GetValue("Qadam1C") as string, Command, StringComparison.OrdinalIgnoreCase);
+            var value = key?.GetValue("Qadam1C") as string;
+            return string.Equals(value, Command, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(value, "\"" + Environment.ProcessPath + "\"", StringComparison.OrdinalIgnoreCase);
         }
         set
         {
@@ -29,5 +31,5 @@ internal static class WindowsStartup
             else key.DeleteValue("Qadam1C", throwOnMissingValue: false);
         }
     }
-    private static string Command => "\"" + Environment.ProcessPath + "\"";
+    private static string Command => "\"" + Environment.ProcessPath + "\" --background";
 }

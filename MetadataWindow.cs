@@ -147,140 +147,200 @@ internal static class MetadataScanner
 internal sealed class MetadataWindow : Form
 {
     private readonly MetadataStore store;
-    private readonly ComboBox target = new() { Dock = DockStyle.Top, DropDownStyle = ComboBoxStyle.DropDownList };
-    private readonly ComboBox cache = new() { Dock = DockStyle.Top, DropDownStyle = ComboBoxStyle.DropDownList };
-    private readonly SearchTextBox search = new() { Dock = DockStyle.Top, PlaceholderText = "Поиск объектов и полей (показаны первые 1000 совпадений)" };
-    private readonly ListBox list = new() { Dock = DockStyle.Fill, HorizontalScrollbar = true };
-    private readonly Label status = new() { Dock = DockStyle.Bottom, Height = 65 };
-    private readonly FlowLayoutPanel actions = new() { Dock = DockStyle.Top, Height = 70, AutoScroll = true };
+    private readonly ComboBox target = new() { Dock = DockStyle.Fill, DropDownStyle = ComboBoxStyle.DropDownList };
+    private readonly ComboBox configurations = new() { Dock = DockStyle.Fill, DropDownStyle = ComboBoxStyle.DropDownList, DisplayMember = "Name" };
+    private readonly Label details = new() { Dock = DockStyle.Fill, AutoEllipsis = true };
+    private readonly Label binding = new() { Dock = DockStyle.Fill, AutoEllipsis = true };
+    private readonly Label status = new() { Dock = DockStyle.Fill, AutoEllipsis = true };
+    private readonly SearchTextBox search = new() { Dock = DockStyle.Fill, PlaceholderText = "Найти объект или поле (первые 1000 совпадений)" };
+    private readonly ListBox objects = new() { Dock = DockStyle.Fill, HorizontalScrollbar = true };
+    private readonly List<Button> buttons = [];
     private CancellationTokenSource? cancellation;
     internal bool Running => cancellation is not null;
-    private ConfiguratorTarget Target => target.SelectedItem as ConfiguratorTarget ?? throw new InvalidOperationException("Выберите открытый Конфигуратор.");
+    private MetadataIndex Selected => configurations.SelectedItem as MetadataIndex
+        ?? throw new InvalidOperationException("Сначала добавьте конфигурацию и выберите её в списке.");
+    private ConfiguratorTarget Target => target.SelectedItem as ConfiguratorTarget
+        ?? throw new InvalidOperationException("Откройте нужную базу в Конфигураторе, нажмите «Обновить окна» и выберите её.");
+
     public MetadataWindow(MetadataStore store)
     {
-        Icon = AppIcon.Value;
         this.store = store;
-        Text = "Qadam1C — метаданные"; Size = new Size(1050, 650); MinimumSize = new Size(800, 450);
+        Icon = AppIcon.Value; Text = "Qadam1C — Мои конфигурации";
+        Size = new Size(1060, 800); MinimumSize = new Size(900, 720);
         StartPosition = FormStartPosition.CenterScreen;
-        void Button(string name, Func<Task> action)
-        {
-            var b = new Button { Text = name, AutoSize = true };
-            b.Click += async (_, _) =>
-            {
-                if (Running) return;
-                try { await action(); }
-                catch (OperationCanceledException) { status.Text = "Ожидание отменено. Уже запущенный отчёт 1С может продолжать формироваться. Кэш не изменён."; }
-                catch (Exception ex)
-                {
-                    status.Text = ex.Message;
-                    try
-                    {
-                        var log = AppDataPaths.FilePath("metadata-error.log");
-                        Directory.CreateDirectory(Path.GetDirectoryName(log)!);
-                        File.WriteAllText(log, ex.ToString());
-                    }
-                    catch (IOException) { }
-                    catch (UnauthorizedAccessException) { }
-                }
-            };
-            actions.Controls.Add(b);
-        }
-        Button("Сканировать в 1С", async () =>
-        {
-            var selected = Target;
-            var existing = store.For(selected.Key)?.Id;
-            cancellation = new();
-            try
-            {
-                target.Enabled = cache.Enabled = false;
-                var path = await MetadataScanner.Scan(selected, Path.Combine(AppContext.BaseDirectory, "data", "reports"),
-                    new Progress<string>(s => status.Text = s), cancellation.Token);
-                status.Text = "Читаю отчёт и строю индекс метаданных…";
-                var index = await Task.Run(() => MetadataReport.Read(path, existing, cancellation.Token));
-                cancellation.Token.ThrowIfCancellationRequested();
-                store.Put(index, selected.Key); Reload(index.Id);
-                status.Text = $"Готово: {index.Entries.Count} объектов и полей. " + BindingStatus();
-                Show(); Activate();
-            }
-            finally { cancellation.Dispose(); cancellation = null; target.Enabled = cache.Enabled = true; }
-        });
-        Button("Импортировать .mxl", async () =>
-        {
-            var selected = Target;
-            using var dialog = new OpenFileDialog { Filter = "Отчёт по конфигурации (*.mxl)|*.mxl" };
-            if (dialog.ShowDialog(this) != DialogResult.OK) return;
-            cancellation = new();
-            try
-            {
-                target.Enabled = cache.Enabled = false;
-                status.Text = "Читаю отчёт и строю индекс метаданных…";
-                var index = await Task.Run(() => MetadataReport.Read(dialog.FileName, cancellation: cancellation.Token));
-                cancellation.Token.ThrowIfCancellationRequested();
-                store.Put(index, selected.Key); Reload(index.Id);
-                status.Text = $"Импортировано: {index.Entries.Count}. " + BindingStatus();
-            }
-            finally { cancellation.Dispose(); cancellation = null; target.Enabled = cache.Enabled = true; }
-        });
-        Button("Подключить кэш", () =>
-        {
-            var selected = cache.SelectedItem as MetadataIndex ?? throw new InvalidOperationException("Выберите кэш.");
-            store.Bind(Target.Key, selected.Id);
-            status.Text = BindingStatus(); return Task.CompletedTask;
-        });
-        Button("Отключить", () => { store.Unbind(Target.Key); status.Text = "Подсказки метаданных отключены для этого сеанса."; return Task.CompletedTask; });
-        Button("Обновить список окон", () => { ReloadTargets(); return Task.CompletedTask; });
-        var cancel = new Button { Text = "Отменить ожидание", AutoSize = true };
-        cancel.Click += (_, _) => cancellation?.Cancel(); actions.Controls.Add(cancel);
-        Controls.Add(list); Controls.Add(search); Controls.Add(actions); Controls.Add(cache);
-        Controls.Add(new Label { Text = "Сохранённый кэш — подключается автоматически для этой базы:", Dock = DockStyle.Top, Height = 25 });
-        Controls.Add(target); Controls.Add(new Label { Text = "Конфигуратор, к которому подключить метаданные:", Dock = DockStyle.Top, Height = 25 });
-        Controls.Add(status);
-        cache.SelectedIndexChanged += (_, _) => ShowEntries();
-        target.SelectedIndexChanged += (_, _) =>
-        {
-            if (target.SelectedItem is ConfiguratorTarget selected)
-            {
-                var bound = store.For(selected.Key);
-                if (bound is not null) cache.SelectedItem = bound;
-                status.Text = BindingStatus();
-            }
-        };
-        search.TextChanged += (_, _) => ShowEntries();
+        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 12, Padding = new Padding(16) };
+        foreach (var height in new[] { 68, 28, 34, 44, 110, 28, 34, 44, 58, 32 })
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, height));
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
+        layout.Controls.Add(new Label { Dock = DockStyle.Fill, Text =
+            "Добавьте папку ручной выгрузки из 1С. Затем выберите открытую базу, где использовать эти данные.\nQadam читает файлы; базу и папку выгрузки не изменяет." }, 0, 0);
+        layout.Controls.Add(new Label { Text = "1. Мои конфигурации", Dock = DockStyle.Fill }, 0, 1);
+        layout.Controls.Add(configurations, 0, 2);
+        var files = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoScroll = true };
+        Add(files, "Добавить папку…", AddFolder);
+        Add(files, "Перечитать файлы", RefreshFiles);
+        Add(files, "Переименовать…", Rename);
+        Add(files, "Убрать из списка…", Remove);
+        Add(files, "Как выгрузить?", () => { ShowHelp(); return Task.CompletedTask; });
+        Add(files, "Импорт MXL…", ImportReport);
+        layout.Controls.Add(files, 0, 3); layout.Controls.Add(details, 0, 4);
+        layout.Controls.Add(new Label { Text = "2. Где использовать выбранную конфигурацию", Dock = DockStyle.Fill }, 0, 5);
+        layout.Controls.Add(target, 0, 6);
+        var connections = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoScroll = true };
+        Add(connections, "Использовать в этой базе", Bind);
+        Add(connections, "Отключить для этой базы", () => { store.Unbind(Target.Key); RefreshBinding(); return Task.CompletedTask; });
+        Add(connections, "Обновить окна", () => { ReloadTargets(); return Task.CompletedTask; });
+        var cancel = new Button { Text = "Отменить чтение", AutoSize = true };
+        cancel.Click += (_, _) => cancellation?.Cancel(); connections.Controls.Add(cancel);
+        layout.Controls.Add(connections, 0, 7); layout.Controls.Add(binding, 0, 8);
+        layout.Controls.Add(search, 0, 9); layout.Controls.Add(objects, 0, 10); layout.Controls.Add(status, 0, 11);
+        Controls.Add(layout);
+        configurations.SelectedIndexChanged += (_, _) => { ShowDetails(); RefreshBinding(); };
+        target.SelectedIndexChanged += (_, _) => RefreshBinding();
+        search.TextChanged += (_, _) => ShowObjects();
         FormClosing += (_, e) => { if (Running) { e.Cancel = true; cancellation?.Cancel(); } };
-        ReloadTargets(); Reload();
-        status.Text = BindingStatus();
+        Reload(); ReloadTargets();
     }
-    private string BindingStatus()
+    private void Add(FlowLayoutPanel panel, string text, Func<Task> action)
     {
-        if (target.SelectedItem is not ConfiguratorTarget selected) return "Откройте Конфигуратор и обновите список окон.";
-        if (!selected.Key.StartsWith("base:")) return "Не удалось определить адрес базы. Подключение кэша доступно для текущего сеанса.";
-        return store.For(selected.Key) is { } bound
-            ? $"Кэш «{bound.Name}» подключён. После перезапуска 1С подключится автоматически."
-            : "Для этой базы кэша ещё нет. Сканируйте конфигурацию, импортируйте отчёт или один раз подключите подходящий кэш.";
+        var button = new Button { Text = text, AutoSize = true, Height = 32 };
+        buttons.Add(button); panel.Controls.Add(button);
+        button.Click += async (_, _) =>
+        {
+            if (Running) return;
+            try { await action(); }
+            catch (OperationCanceledException) { status.Text = "Чтение отменено. Ранее сохранённые данные не изменены."; }
+            catch (Exception ex) { status.Text = ex.Message; MessageBox.Show(this, ex.Message, "Не удалось выполнить действие", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+        };
     }
-    private void ReloadTargets()
+    private async Task Read(Func<CancellationToken, MetadataIndex> read)
     {
-        target.Items.Clear(); target.Items.AddRange(ConfiguratorTarget.List());
-        if (target.Items.Count > 0) target.SelectedIndex = 0;
+        cancellation = new();
+        foreach (var b in buttons) b.Enabled = false;
+        configurations.Enabled = target.Enabled = false;
+        status.Text = "Читаю файлы. Дождитесь завершения…";
+        try
+        {
+            var token = cancellation.Token;
+            var index = await Task.Run(() => read(token), token);
+            token.ThrowIfCancellationRequested();
+            store.SaveConfiguration(index); Reload(index.Id);
+            status.Text = "Файлы прочитаны. Для использования в 1С выберите базу во втором шаге.";
+        }
+        finally
+        {
+            cancellation.Dispose(); cancellation = null;
+            foreach (var b in buttons) b.Enabled = true;
+            configurations.Enabled = target.Enabled = true;
+        }
+    }
+    private async Task AddFolder()
+    {
+        using var picker = new FolderBrowserDialog { Description = "Выберите папку с Configuration.xml и ConfigDumpInfo.xml", UseDescriptionForTitle = true };
+        if (picker.ShowDialog(this) != DialogResult.OK) return;
+        var existing = store.Caches.FirstOrDefault(c => c.SourceKind == "xml-folder" &&
+            string.Equals(Path.GetFullPath(c.Source).TrimEnd(Path.DirectorySeparatorChar), Path.GetFullPath(picker.SelectedPath).TrimEnd(Path.DirectorySeparatorChar), StringComparison.OrdinalIgnoreCase));
+        await Read(t => ConfigurationFolder.Read(picker.SelectedPath, existing, t));
+    }
+    private async Task RefreshFiles()
+    {
+        var selected = Selected;
+        await Read(t => selected.SourceKind == "xml-folder" ? ConfigurationFolder.Read(selected.Source, selected, t, allowExtension: selected.ExtensionName is not null)
+            : MetadataReport.Read(selected.Source, selected.Id, t) with { Name = selected.Name });
+    }
+    private async Task ImportReport()
+    {
+        using var picker = new OpenFileDialog { Filter = "Отчёт по конфигурации (*.mxl)|*.mxl", Title = "Дополнительный способ: импорт отчёта MXL" };
+        if (picker.ShowDialog(this) == DialogResult.OK) await Read(t => MetadataReport.Read(picker.FileName, cancellation: t));
+    }
+    private Task Rename()
+    {
+        var selected = Selected;
+        using var dialog = new Form { Text = "Название в Qadam1C", Size = new Size(450, 180), StartPosition = FormStartPosition.CenterParent,
+            FormBorderStyle = FormBorderStyle.FixedDialog, MaximizeBox = false, MinimizeBox = false };
+        var name = new TextBox { Text = selected.Name, Dock = DockStyle.Top, MaxLength = 100 };
+        var hint = new Label { Text = "Например: УНФ — рабочая или УНФ — тестовая. Имя в 1С не изменится.", Dock = DockStyle.Top, Height = 44 };
+        var ok = new Button { Text = "Сохранить", Dock = DockStyle.Bottom, DialogResult = DialogResult.OK };
+        dialog.Controls.Add(name); dialog.Controls.Add(hint); dialog.Controls.Add(ok); dialog.AcceptButton = ok;
+        if (dialog.ShowDialog(this) == DialogResult.OK)
+        {
+            if (string.IsNullOrWhiteSpace(name.Text)) throw new InvalidOperationException("Введите название конфигурации.");
+            store.SaveConfiguration(selected with { Name = name.Text.Trim() }); Reload(selected.Id);
+        }
+        return Task.CompletedTask;
+    }
+    private Task Remove()
+    {
+        var selected = Selected;
+        if (MessageBox.Show(this, $"Убрать «{selected.Name}» из Qadam1C и отключить её от баз?\nФайлы выгрузки и база 1С останутся на месте.",
+            "Убрать конфигурацию", MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes)
+        { store.Remove(selected.Id); Reload(); status.Text = "Конфигурация убрана из списка. Исходные файлы сохранены."; }
+        return Task.CompletedTask;
+    }
+    private Task Bind()
+    {
+        var selected = Selected; var destination = Target;
+        if (selected.ExtensionName is not null) throw new InvalidOperationException("Расширения подключаются автоматически мастером «Подключить базы». Не подключайте расширение вместо основной конфигурации.");
+        if (!ConfiguratorTarget.List().Any(t => t.Pid == destination.Pid && t.Started == destination.Started))
+            throw new InvalidOperationException("Это окно 1С уже закрыто. Обновите список окон.");
+        if (MessageBox.Show(this, $"Использовать данные «{selected.Name}» в окне:\n{destination.Title}\n\nПроверьте, что выгрузка сделана именно из этой базы. По папке это нельзя установить автоматически.",
+            "Подключить конфигурацию", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return Task.CompletedTask;
+        store.Bind(destination.Key, selected.Id); RefreshBinding();
+        status.Text = "Подключено. После изменений в 1С повторите ручную выгрузку и перечитайте файлы.";
+        return Task.CompletedTask;
     }
     private void Reload(string? id = null)
     {
-        id ??= target.SelectedItem is ConfiguratorTarget selected ? store.For(selected.Key)?.Id : null;
-        cache.Items.Clear(); cache.Items.AddRange(store.Caches.Cast<object>().ToArray());
-        if (id is not null) cache.SelectedItem = store.Caches.FirstOrDefault(c => c.Id == id);
-        else if (cache.Items.Count > 0) cache.SelectedIndex = 0;
+        configurations.Items.Clear(); configurations.Items.AddRange(store.Caches.Cast<object>().ToArray());
+        configurations.SelectedItem = store.Caches.FirstOrDefault(c => c.Id == id);
+        if (configurations.SelectedIndex < 0 && configurations.Items.Count > 0) configurations.SelectedIndex = 0;
+        ShowDetails(); RefreshBinding();
     }
-    private void ShowEntries()
+    private void ReloadTargets()
     {
-        list.BeginUpdate();
+        var previous = target.SelectedItem as ConfiguratorTarget;
+        target.Items.Clear(); target.Items.AddRange(ConfiguratorTarget.List());
+        target.SelectedItem = target.Items.Cast<ConfiguratorTarget>().FirstOrDefault(t => t.Pid == previous?.Pid && t.Started == previous.Started);
+        if (target.SelectedIndex < 0 && target.Items.Count == 1) target.SelectedIndex = 0;
+        RefreshBinding();
+    }
+    private void RefreshBinding()
+    {
+        if (target.SelectedItem is not ConfiguratorTarget t)
+        { binding.Text = "Выберите нужное окно. Если списка нет — откройте Конфигуратор и нажмите «Обновить окна». Папки можно добавлять без открытой 1С."; return; }
+        var current = store.For(t.Key);
+        binding.Text = (current is null ? "Для этой базы ничего не подключено." : $"Сейчас используется: {current.Name}.") +
+            (t.Key.StartsWith("base:") ? " Подключение сохраняется после перезапуска 1С." : " Адрес базы не определён: подключение действует только до закрытия этого сеанса 1С.");
+    }
+    private void ShowDetails()
+    {
+        details.Text = configurations.SelectedItem is MetadataIndex i
+            ? $"Источник: {i.Source}\nПрочитано: {i.Updated:g}. Объектов и полей: {i.Entries.Count}.\n" +
+                (i.SourceKind == "xml-folder" ? $"Найдено файлов модулей: {i.ModuleCount}. " + (i.TypeSchemaVersion > 0 ? "Прочитаны типы реквизитов для подсказок после точки.\n" : "Для типов реквизитов нажмите «Перечитать файлы».\n") : "Отчёт MXL: структура и типы полей, без текстов модулей.\n") +
+                "После изменений в 1С повторите выгрузку, затем нажмите «Перечитать файлы»."
+            : "Пока нет конфигураций. Нажмите «Как выгрузить?», затем «Добавить папку…». Открывать базу в Qadam не требуется.";
+        ShowObjects();
+    }
+    private void ShowObjects()
+    {
+        objects.BeginUpdate();
         try
         {
-        list.Items.Clear();
-        if (cache.SelectedItem is MetadataIndex index)
-            list.Items.AddRange(index.Entries.Where(e => (e.Path + " " + e.Synonym).Contains(search.Text, StringComparison.OrdinalIgnoreCase))
-                .Take(1000)
-                .Select(e => (object)(e.Path + (e.Types.Length > 0 ? " : " + string.Join(", ", e.Types) : ""))).ToArray());
+            objects.Items.Clear();
+            if (configurations.SelectedItem is MetadataIndex i)
+                objects.Items.AddRange(i.Entries.Where(e => (e.Path + " " + e.Synonym).Contains(search.Text, StringComparison.OrdinalIgnoreCase))
+                    .Take(1000).Select(e => (object)e.Path).ToArray());
         }
-        finally { list.EndUpdate(); }
+        finally { objects.EndUpdate(); }
     }
+    private void ShowHelp() => MessageBox.Show(this,
+        "1. В Конфигураторе выберите «Конфигурация → Выгрузить конфигурацию в файлы…».\n" +
+        "2. Укажите отдельную папку для этой базы и иерархический формат. Дождитесь завершения.\n" +
+        "3. Здесь нажмите «Добавить папку…» и выберите папку с Configuration.xml и ConfigDumpInfo.xml.\n" +
+        "4. При необходимости переименуйте запись, например «УНФ — тестовая».\n" +
+        "5. Выберите нужное окно 1С и нажмите «Использовать в этой базе».\n\n" +
+        "Для обновления повторите выгрузку в ту же папку и нажмите «Перечитать файлы». Эта кнопка не запускает выгрузку.\n" +
+        "Для выгрузки и подключения расширений используйте «Подключить базы / обновить выгрузку» в меню Qadam возле часов.",
+        "Как подготовить конфигурацию", MessageBoxButtons.OK, MessageBoxIcon.Information);
 }

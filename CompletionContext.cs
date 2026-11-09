@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Text;
 using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
@@ -135,12 +135,20 @@ internal static class EditorReader
         }
     }
     internal static AutomationElement? FocusedDocument(IntPtr window)
+        => FindDocument(window, requireFocus: true);
+
+    // Decoration belongs to the visible document, not keyboard focus. Keep the
+    // completion/editing reader strict: it must never type into an unfocused tab.
+    internal static AutomationElement? VisibleDocument(IntPtr window)
+        => FindDocument(window, requireFocus: false);
+
+    private static AutomationElement? FindDocument(IntPtr window, bool requireFocus)
     {
         if (CompletionNative.GetForegroundWindow() != window) return null;
         CompletionNative.GetWindowThreadProcessId(window, out var pid);
         using var process = Process.GetProcessById((int)pid);
         if (process.ProcessName != "1cv8" || !process.MainWindowTitle.Contains("Конфигуратор")) return null;
-        var scope = EditorScope(window, out _);
+        var scope = requireFocus ? EditorScope(window, out _) : IntPtr.Zero;
         var root = AutomationElement.FromHandle(scope == IntPtr.Zero ? window : scope);
         if (root.Current.ProcessId != pid || !root.Current.IsEnabled) return null;
         // 1C can implement every editor as a virtual control under the main HWND.
@@ -149,6 +157,7 @@ internal static class EditorReader
         var pending = new Stack<(AutomationElement Element, int Depth)>();
         pending.Push((root, 0));
         var visited = 0;
+        var documents = new List<(AutomationElement Element, bool Focused)>();
         while (pending.Count > 0 && visited++ < 1500)
         {
             var (element, depth) = pending.Pop();
@@ -156,11 +165,14 @@ internal static class EditorReader
             if (state.ProcessId != pid || state.IsOffscreen) continue;
             if (state.ControlType == ControlType.Document)
             {
-                if (state.HasKeyboardFocus &&
-                    !(bool)element.GetCurrentPropertyValue(AutomationElement.IsGridPatternAvailableProperty) &&
+                if (!(bool)element.GetCurrentPropertyValue(AutomationElement.IsGridPatternAvailableProperty) &&
                     !(bool)element.GetCurrentPropertyValue(AutomationElement.IsTablePatternAvailableProperty) &&
                     (bool)element.GetCurrentPropertyValue(AutomationElement.IsTextPatternAvailableProperty))
-                    return element;
+                {
+                    if (requireFocus && state.HasKeyboardFocus) return element;
+                    if (!requireFocus && state.IsEnabled && state.BoundingRectangle.Width > 0 && state.BoundingRectangle.Height > 0)
+                        documents.Add((element, state.HasKeyboardFocus));
+                }
                 continue;
             }
             if (depth >= 18 || state.ControlType == ControlType.Table || state.ControlType == ControlType.DataGrid ||
@@ -174,7 +186,19 @@ internal static class EditorReader
                 child = TreeWalker.ControlViewWalker.GetNextSibling(child);
             }
         }
-        return null;
+        // If discovery was truncated, another visible document might have been
+        // missed. Never choose a background editor merely because it was first.
+        if (pending.Count > 0) return null;
+        var selected = ChooseVisibleDocument(documents.Select(d => d.Focused).ToArray());
+        return selected < 0 ? null : documents[selected].Element;
+    }
+
+    internal static int ChooseVisibleDocument(IReadOnlyList<bool> focused)
+    {
+        var selected = -1;
+        for (var i = 0; i < focused.Count; i++)
+            if (focused[i]) { if (selected >= 0) return -1; selected = i; }
+        return selected >= 0 ? selected : focused.Count == 1 ? 0 : -1;
     }
     private static IntPtr EditorScope(IntPtr window, out string title)
     {
@@ -248,7 +272,12 @@ internal sealed class CompletionPopup : Form
 {
     private IntPtr ownerWindow;
     public string[] Items { get; private set; } = [];
+    private string?[] typeTexts = [];
+    private bool HasTypes => typeTexts.Any(t => t is not null);
+    private int HeaderHeight => HasTypes ? 26 : 0;
+    private int typeColumn;
     public int Selected { get; set; }
+    internal bool DefinitionAvailable { get; set; }
     internal int PaintCount { get; private set; }
     internal int PositionUpdates { get; private set; }
     internal int VisibilityChanges { get; private set; }
@@ -285,13 +314,18 @@ internal sealed class CompletionPopup : Form
         if (m.Msg == 0x21) { m.Result = new IntPtr(3); return; } // MA_NOACTIVATE
         base.WndProc(ref m);
     }
-    public void Present(EditorSnapshot snapshot, string[] items)
+    public void Present(EditorSnapshot snapshot, string[] items, string?[]? types = null)
     {
-        var contentChanged = !Items.SequenceEqual(items);
+        types ??= new string?[items.Length];
+        var contentChanged = !Items.SequenceEqual(items) || !typeTexts.SequenceEqual(types);
         if (contentChanged) Selected = 0;
         Items = items;
-        var desiredSize = new Size(390, items.Length * 30 + 36);
+        typeTexts = types;
         var area = Screen.FromPoint(new DrawingPoint(snapshot.X, snapshot.Y)).WorkingArea;
+        typeColumn = HasTypes ? Math.Clamp(items.Select(s => TextRenderer.MeasureText(s, Font).Width).DefaultIfEmpty().Max() + 28, 220, 360) : 0;
+        var typeWidth = HasTypes ? Math.Clamp(types.Select(s => TextRenderer.MeasureText(s ?? "", Font).Width).DefaultIfEmpty().Max() + 28, 200, 330) : 0;
+        var desiredSize = new Size(Math.Min(area.Width, HasTypes ? typeColumn + typeWidth : 390), items.Length * 30 + 36 + HeaderHeight);
+        if (HasTypes) typeColumn = Math.Min(typeColumn, desiredSize.Width / 2);
         var desiredLocation = new DrawingPoint(Math.Clamp(snapshot.X, area.Left, Math.Max(area.Left, area.Right - desiredSize.Width)),
             Math.Clamp(snapshot.Y, area.Top, Math.Max(area.Top, area.Bottom - desiredSize.Height)));
         var geometryChanged = Size != desiredSize || Location != desiredLocation;
@@ -322,19 +356,36 @@ internal sealed class CompletionPopup : Form
     {
         PaintCount++;
         base.OnPaint(e);
+        using var footerFont = new Font("Segoe UI", 9);
+        var flags = TextFormatFlags.Left | TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis | TextFormatFlags.SingleLine;
+        if (HasTypes)
+        {
+            TextRenderer.DrawText(e.Graphics, "Имя", footerFont, new Rectangle(10, 4, typeColumn - 20, 21), Color.Silver, flags);
+            TextRenderer.DrawText(e.Graphics, "Тип", footerFont, new Rectangle(typeColumn + 12, 4, Width - typeColumn - 22, 21), Color.Silver, flags);
+            using var line = new Pen(Color.FromArgb(63, 76, 93));
+            e.Graphics.DrawLine(line, 1, HeaderHeight - 1, Width - 2, HeaderHeight - 1);
+        }
         for (var i = 0; i < Items.Length; i++)
         {
+            var y = HeaderHeight + i * 30;
             if (i == Selected)
             {
                 using var brush = new SolidBrush(Color.FromArgb(42, 90, 128));
-                e.Graphics.FillRectangle(brush, 1, i * 30 + 1, Width - 2, 30);
+                e.Graphics.FillRectangle(brush, 1, y + 1, Width - 2, 30);
             }
-            TextRenderer.DrawText(e.Graphics, Items[i], Font, new Rectangle(10, i * 30 + 4, Width - 20, 27), ForeColor,
-                TextFormatFlags.Left | TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis);
+            TextRenderer.DrawText(e.Graphics, Items[i], Font, new Rectangle(10, y + 4, HasTypes ? typeColumn - 20 : Width - 20, 27), ForeColor, flags);
+            if (HasTypes)
+                TextRenderer.DrawText(e.Graphics, typeTexts.ElementAtOrDefault(i) ?? "", Font,
+                    new Rectangle(typeColumn + 12, y + 4, Width - typeColumn - 22, 27),
+                    i == Selected ? Color.FromArgb(215, 233, 247) : Color.FromArgb(155, 184, 205), flags);
         }
-        using var footerFont = new Font("Segoe UI", 9);
-        TextRenderer.DrawText(e.Graphics, "Qadam1C · Tab принять · ↑↓ выбрать · Esc закрыть", footerFont,
-            new Rectangle(8, Items.Length * 30 + 7, Width - 16, 22), Color.LightGray,
+        if (HasTypes)
+        {
+            using var divider = new Pen(Color.FromArgb(63, 76, 93));
+            e.Graphics.DrawLine(divider, typeColumn, 5, typeColumn, HeaderHeight + Items.Length * 30 - 3);
+        }
+        TextRenderer.DrawText(e.Graphics, DefinitionAvailable ? "Tab принять · ↑↓ выбрать · Alt+F12 код · Esc закрыть" : "Qadam1C · Tab принять · ↑↓ выбрать · Esc закрыть", footerFont,
+            new Rectangle(8, HeaderHeight + Items.Length * 30 + 7, Width - 16, 22), Color.LightGray,
             TextFormatFlags.Left | TextFormatFlags.NoPrefix);
         e.Graphics.DrawRectangle(Pens.SlateGray, 0, 0, Width - 1, Height - 1);
     }
@@ -357,6 +408,9 @@ internal sealed class CompletionContext : ApplicationContext
     private readonly MetadataStore metadata = new(AppDataPaths.FilePath("metadata.json"));
     private readonly CompletionHistory history = new(AppDataPaths.FilePath("completion-history.json"));
     private MetadataWindow? metadataWindow;
+    private ExportWizard? exportWizard;
+    private MethodDefinitionWindow? definitionWindow;
+    private readonly EventWaitHandle exportRequest = new(false, EventResetMode.AutoReset, "Local\\Qadam1C.Export");
     private readonly FavoritesStore favorites = new(AppDataPaths.FilePath("favorites.json"));
     private FavoritesWindow? favoritesWindow;
     private readonly EventWaitHandle favoritesRequest = new(false, EventResetMode.AutoReset, "Local\\Qadam1C.Favorites");
@@ -366,6 +420,7 @@ internal sealed class CompletionContext : ApplicationContext
     private bool busy, paused, manual, accepting, suppressedTab, suppressedEscape;
     private bool suppressedDuplicate;
     private bool suppressedFavorite;
+    private bool suppressedDefinition;
     private int transientMisses;
     private string? dismissed;
     private string? lastDiagnostic;
@@ -400,7 +455,8 @@ internal sealed class CompletionContext : ApplicationContext
         pause.CheckedChanged += (_, _) => { paused = pause.Checked; InvalidateSuggestion(); actionButton.Dismiss(); };
         menu.Items.Add(pause);
         menu.Items.Add("Шаблоны…", null, (_, _) => OpenTemplates());
-        menu.Items.Add("Метаданные…", null, (_, _) => OpenMetadata());
+        menu.Items.Add("Мои конфигурации…", null, (_, _) => OpenMetadata());
+        menu.Items.Add("Подключить базы / обновить выгрузку…", null, (_, _) => OpenExportWizard());
         menu.Items.Add("Панель разработчика…", null, (_, _) => OpenFavorites());
         var startup = new ToolStripMenuItem("Запускать вместе с Windows") { Checked = WindowsStartup.Enabled };
         startup.Click += (_, _) =>
@@ -417,7 +473,7 @@ internal sealed class CompletionContext : ApplicationContext
             Visible = true, ContextMenuStrip = menu
         };
         tray.DoubleClick += (_, _) => OpenTemplates();
-        timer.Tick += async (_, _) => { if (templateRequest.WaitOne(0)) OpenTemplates(); if (metadataRequest.WaitOne(0)) OpenMetadata(); if (favoritesRequest.WaitOne(0)) OpenFavorites(); await RefreshAsync(); };
+        timer.Tick += async (_, _) => { if (exportRequest.WaitOne(0)) OpenExportWizard(); if (templateRequest.WaitOne(0)) OpenTemplates(); if (metadataRequest.WaitOne(0)) OpenMetadata(); if (favoritesRequest.WaitOne(0)) OpenFavorites(); await RefreshAsync(); };
         timer.Start();
     }
 
@@ -429,9 +485,18 @@ internal sealed class CompletionContext : ApplicationContext
     }
     internal void OpenMetadata()
     {
+        if (exportWizard?.Running == true) { OpenExportWizard(); return; }
         InvalidateSuggestion();
         if (metadataWindow is null || metadataWindow.IsDisposed) metadataWindow = new MetadataWindow(metadata);
         ShowEditorTool(metadataWindow);
+    }
+    internal void OpenExportWizard()
+    {
+        if (metadataWindow?.Running == true) { OpenMetadata(); return; }
+        InvalidateSuggestion();
+        metadataWindow?.Close();
+        if (exportWizard is null || exportWizard.IsDisposed) exportWizard = new ExportWizard(metadata);
+        ShowEditorTool(exportWizard);
     }
     private sealed record EditorOwner(IntPtr Handle) : IWin32Window;
     internal void OpenFavorites()
@@ -490,7 +555,7 @@ internal sealed class CompletionContext : ApplicationContext
     {
         actionButton.CheckForeground();
         if (busy || accepting || (paused && favoritesWindow is not { IsDisposed: false, Visible: true }) ||
-            metadataWindow?.Running == true || favoritesWindow?.Navigating == true || actionButton.MenuVisible) return;
+            exportWizard?.Running == true || metadataWindow?.Running == true || favoritesWindow?.Navigating == true || actionButton.MenuVisible) return;
         busy = true;
         var version = generation;
         try
@@ -513,13 +578,25 @@ internal sealed class CompletionContext : ApplicationContext
             if (!snapshot.CanComplete) { HideSuggestion(); return; }
             var key = $"{snapshot.Window}:{snapshot.Offset}:{snapshot.Prefix}";
             if (dismissed == key && !manual) { HideSuggestion(); return; }
-            choices = SmartCompletion.Find(snapshot, snippets.Items, metadata.For(snapshot.Session), history, manual);
-            var items = choices.Select(c => c.Label).ToArray();
+            var documentIndex = metadata.ForDocument(snapshot.Session, snapshot.WindowTitle);
+            var moduleSources = metadata.CommonModuleSources(snapshot.Session, snapshot.WindowTitle);
+            var requestedManually = manual;
+            var availableSnippets = snippets.Items.ToArray();
+            var result = await Task.Run(() => SmartCompletion.Find(snapshot, availableSnippets, documentIndex, history, requestedManually, moduleSources));
+            if (version != generation || accepting) return;
+            // Initial index loading may take time. Never display results for an old caret or document.
+            var current = await Task.Run(EditorReader.ReadForActions);
+            if (current is null || current.Window != snapshot.Window || current.Session != snapshot.Session ||
+                current.WindowTitle != snapshot.WindowTitle || current.Offset != snapshot.Offset || current.Text != snapshot.Text)
+            { HideSuggestion(); return; }
+            choices = result;
+            popup.DefinitionAvailable = choices.Any(c => c.Definition is not null);
+            var items = choices.Select(c => c.TypeText is null ? c.Label : c.InsertText ?? c.Label).ToArray();
             manual = false;
             if (items.Length == 0) { Diagnose($"reader=ready; prefixLength={snapshot.Prefix.Length}; candidates=0"); HideSuggestion(); return; }
             shown = snapshot;
             visualSnapshot = snapshot;
-            popup.Present(snapshot, items);
+            popup.Present(snapshot, items, choices.Select(c => c.TypeText).ToArray());
             var foreground = CompletionNative.GetForegroundWindow();
             CompletionNative.GetWindowThreadProcessId(foreground, out var foregroundPid);
             Diagnose($"reader=ready; prefixLength={snapshot.Prefix.Length}; candidates={items.Length}; visible={popup.IsPresented}; location={popup.Left},{popup.Top}; paints={popup.PaintCount}; positionUpdates={popup.PositionUpdates}; visibilityChanges={popup.VisibilityChanges}; foregroundMatches={foreground == snapshot.Window}; foregroundPid={foregroundPid}; foregroundHandle={foreground.ToInt64():X}; popupHandle={popup.Handle.ToInt64():X}");
@@ -555,6 +632,7 @@ internal sealed class CompletionContext : ApplicationContext
             return CompletionNative.CallNextHookEx(hook, code, message, data);
         }
         if (up && input.Key == 27 && suppressedEscape) { suppressedEscape = false; return (IntPtr)1; }
+        if (up && input.Key == 0x7B && suppressedDefinition) { suppressedDefinition = false; return CompletionNative.CallNextHookEx(hook, code, message, data); }
         if (up && input.Key == 0x44 && suppressedDuplicate) { suppressedDuplicate = false; return (IntPtr)1; }
         if (up && input.Key == 0x42 && suppressedFavorite) { suppressedFavorite = false; return (IntPtr)1; }
         if (down && input.Key == 0x42 && suppressedFavorite) return (IntPtr)1;
@@ -615,6 +693,19 @@ internal sealed class CompletionContext : ApplicationContext
             return (IntPtr)1;
         }
         var active = shown is not null && popup.IsPresented && CompletionNative.GetForegroundWindow() == shown.Window;
+        if (active && input.Key == 0x7B && CompletionNative.IsDown(0x12) && !CompletionNative.IsDown(0x11) &&
+            !CompletionNative.IsDown(0x10) && choices.ElementAtOrDefault(popup.Selected)?.Definition is { } definition)
+        {
+            suppressedDefinition = true;
+            if (!accepting)
+            {
+                accepting = true;
+                var origin = shown!;
+                InvalidateSuggestion();
+                popup.BeginInvoke(async () => await OpenDefinitionAsync(origin, definition));
+            }
+            return (IntPtr)1;
+        }
         var modified = CompletionNative.IsDown(0x11) || CompletionNative.IsDown(0x12) || CompletionNative.IsDown(0x10);
         if (input.Key == 32 && CompletionNative.IsDown(0x11) && CompletionNative.IsDown(0x12) &&
             latest is not null && CompletionNative.GetForegroundWindow() == latest.Window)
@@ -666,6 +757,31 @@ internal sealed class CompletionContext : ApplicationContext
         return CompletionNative.CallNextHookEx(hook, code, message, data);
     }
 
+    private async Task OpenDefinitionAsync(EditorSnapshot expected, MethodDefinition definition)
+    {
+        try
+        {
+            for (var attempt = 0; attempt < 40 && (CompletionNative.IsDown(0x12) || CompletionNative.IsDown(0x7B)); attempt++)
+                await Task.Delay(25);
+            if (CompletionNative.IsDown(0x12) || CompletionNative.IsDown(0x7B)) return;
+            var document = await Task.Run(() => DefinitionReader.Read(definition));
+            var current = await Task.Run(EditorReader.ReadForActions);
+            if (current is null || !ModuleOutline.SameModule(expected, current) || current.Offset != expected.Offset) return;
+            var owner = ConfiguratorTarget.List().SingleOrDefault(t => t.Window == expected.Window.ToInt64() && t.Key == expected.Session);
+            if (owner is null) return;
+            definitionWindow?.Dispose();
+            definitionWindow = new MethodDefinitionWindow(document);
+            definitionWindow.FormClosed += (_, _) =>
+            {
+                if (ConfiguratorTarget.List().Any(t => t.Pid == owner.Pid && t.Started == owner.Started && t.Window == owner.Window))
+                    DefinitionFocus.Return(expected.Window);
+            };
+            dismissed = $"{expected.Window}:{expected.Offset}:{expected.Prefix}";
+            definitionWindow.Show(); definitionWindow.Activate();
+        }
+        catch (Exception ex) { TrayNotifications.Show(tray, 4000, "Qadam1C — определение", ex.Message, ToolTipIcon.Warning); }
+        finally { accepting = false; }
+    }
     private async Task AcceptAsync(EditorSnapshot expected, CompletionChoice word)
     {
         var version = generation;
@@ -754,6 +870,8 @@ internal sealed class CompletionContext : ApplicationContext
     }
     protected override void ExitThreadCore()
     {
+        if (exportWizard?.Running == true)
+        { MessageBox.Show("Дождитесь выгрузки или отмените её в окне подключения баз.", "Qadam1C"); return; }
         timer.Stop();
         timer.Dispose();
         CompletionNative.UnhookWindowsHookEx(hook);
@@ -762,9 +880,11 @@ internal sealed class CompletionContext : ApplicationContext
         popup.Dispose();
         actionButton.Dispose();
         manager?.Dispose();
+        definitionWindow?.Dispose();
         templateRequest.Dispose();
         metadataRequest.Dispose();
         metadataWindow?.Dispose();
+        exportWizard?.Dispose(); exportRequest.Dispose();
         favoritesRequest.Dispose();
         favoritesWindow?.Dispose();
         base.ExitThreadCore();

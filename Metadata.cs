@@ -9,6 +9,12 @@ namespace Qadam1C;
 internal sealed record MetadataEntry(string Path, string Name, string Synonym, string[] Types, string[] Registers);
 internal sealed record MetadataIndex(string Id, string Name, string Source, DateTime Updated, List<MetadataEntry> Entries)
 {
+    public string? ConfigurationId { get; init; }
+    public string? SourceKind { get; init; }
+    public int ModuleCount { get; init; }
+    public string? BaseKey { get; init; }
+    public string? ExtensionName { get; init; }
+    public int TypeSchemaVersion { get; init; }
     public override string ToString() => $"{Name} — {Entries.Count} объектов и полей — {Updated:g}";
 }
 internal sealed record ConfiguratorTarget(int Pid, long Started, long Window, string Title)
@@ -145,6 +151,36 @@ internal sealed class MetadataStore
             throw new InvalidDataException("Не удалось прочитать кэш метаданных.") : new([], []);
     }
     public MetadataIndex? For(string session) => state.Bindings.TryGetValue(session, out var id) ? state.Caches.Find(c => c.Id == id) : null;
+    internal void UpgradeTypes()
+    {
+        var updated = state.Caches.Select(c => c.SourceKind == "xml-folder" ? MetadataTypes.Enrich(c, default) : c).ToList();
+        Save(new(updated, new(state.Bindings)));
+    }
+    public MetadataIndex? ForDocument(string session, string title)
+    {
+        var extension = Regex.Match(title, @"\[(Расширение[^\]]*)\]", RegexOptions.IgnoreCase);
+        if (!extension.Success) return For(session);
+        var caption = extension.Groups[1].Value.Trim();
+        var shortCaption = Regex.Replace(caption, @"^Расширение\s+", "", RegexOptions.IgnoreCase);
+        var matches = state.Caches.Where(c => c.BaseKey == session &&
+            (ExtensionCaption.Matches(c, caption) || ExtensionCaption.Matches(c, shortCaption))).ToArray();
+        return matches.Length == 1 ? matches[0] : null;
+    }
+    public MetadataIndex[] CommonModuleSources(string session, string title)
+    {
+        var document = ForDocument(session, title);
+        if (document is null) return [];
+        var main = For(session);
+        return main is not null && main.Id != document.Id ? [main, document] : [document];
+    }
+    public void PublishBase(string key, IReadOnlyList<MetadataIndex> indexes)
+    {
+        var main = indexes.Single(i => i.ExtensionName is null);
+        var removed = state.Caches.Where(c => c.BaseKey == key).Select(c => c.Id).ToHashSet();
+        var bindings = state.Bindings.Where(p => !removed.Contains(p.Value)).ToDictionary(p => p.Key, p => p.Value);
+        bindings[key] = main.Id;
+        Save(new(state.Caches.Where(c => c.BaseKey != key).Concat(indexes).ToList(), bindings));
+    }
     private void Save(State value)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path))!);
@@ -158,6 +194,10 @@ internal sealed class MetadataStore
         var bindings = new Dictionary<string, string>(state.Bindings) { [session] = index.Id };
         Save(new(caches, bindings));
     }
+    public void SaveConfiguration(MetadataIndex index) =>
+        Save(new(state.Caches.Where(c => c.Id != index.Id).Append(index).ToList(), new(state.Bindings)));
+    public void Remove(string id) => Save(new(state.Caches.Where(c => c.Id != id).ToList(),
+        state.Bindings.Where(p => p.Value != id).ToDictionary(p => p.Key, p => p.Value)));
     public void Bind(string session, string id)
     {
         if (!state.Caches.Any(c => c.Id == id)) throw new InvalidOperationException("Кэш не найден.");

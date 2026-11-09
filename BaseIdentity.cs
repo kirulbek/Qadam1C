@@ -23,7 +23,19 @@ internal static class BaseIdentity
                 rows = ((dynamic)service).ExecQuery($"SELECT CommandLine FROM Win32_Process WHERE ProcessId={pid}");
                 foreach (var row in (System.Collections.IEnumerable)rows)
                 {
-                    try { return FromCommandLine((string?)((dynamic)row).CommandLine) ?? session; }
+                    try
+                    {
+                        var command = (string?)((dynamic)row).CommandLine;
+                        var direct = FromCommandLine(command);
+                        if (direct is not null) return direct;
+                        var name = RegisteredName(command);
+                        if (name is not null)
+                        {
+                            var matches = InfobaseCatalog.Load(out var warnings).Where(b => b.Name.Equals(name, StringComparison.OrdinalIgnoreCase)).ToArray();
+                            if (matches.Length == 1) return matches[0].Key;
+                        }
+                        return session;
+                    }
                     finally { Release(row); }
                 }
             }
@@ -31,6 +43,12 @@ internal static class BaseIdentity
             finally { Release(rows); Release(service); Release(locator); }
             return session;
         });
+    }
+
+    internal static string? RegisteredName(string? command)
+    {
+        var match = Regex.Match(command ?? "", @"(?:^|\s)/IBName(?:\s*""([^""]+)""|\s+(\S+))", RegexOptions.IgnoreCase);
+        return match.Success ? (match.Groups[1].Success ? match.Groups[1].Value : match.Groups[2].Value) : null;
     }
 
     private static void Release(object? value)

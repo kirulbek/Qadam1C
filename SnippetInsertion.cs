@@ -7,6 +7,8 @@ namespace Qadam1C;
 internal sealed record CompletionChoice(string Label, int ReplaceLength, Snippet? Template = null, string? InsertText = null,
     int? Cursor = null, string? SearchText = null)
 {
+    public MethodDefinition? Definition { get; init; }
+    public string? TypeText { get; init; }
     public static CompletionChoice[] Find(EditorSnapshot snapshot, IEnumerable<Snippet> snippets, bool manual)
     {
         var before = snapshot.Text[..snapshot.Offset];

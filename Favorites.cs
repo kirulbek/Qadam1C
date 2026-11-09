@@ -262,7 +262,7 @@ internal sealed class FavoritesWindow : Form
     {
         list.Items.Clear();
         if (Index is { } index) list.Items.AddRange(favorites.For(index.Id).Cast<object>().ToArray());
-        status.Text = Index is null ? "Выберите индекс. Если его нет, сначала откройте «Метаданные» и выполните сканирование."
+        status.Text = Index is null ? "Выберите конфигурацию. Если списка нет, откройте «Мои конфигурации» и добавьте папку выгрузки или отчёт MXL."
             : list.Items.Count == 0 ? "Добавьте нужные объекты. Двойной щелчок выделяет объект в дереве 1С."
             : "Двойной щелчок или Enter — перейти. В дереве или модуле 1С: Ctrl+Alt+B — добавить текущий объект.";
     }
